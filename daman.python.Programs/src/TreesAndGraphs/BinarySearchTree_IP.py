@@ -201,3 +201,7 @@ class BinarySearchTree:
                                     currentNode.rightChild.payload,
                                     currentNode.rightChild.leftChild,
                                     currentNode.rightChild.rightChild)
+                    
+    def getAllNodes(self):
+        #This function will return list of all nodes of BST
+        pass
