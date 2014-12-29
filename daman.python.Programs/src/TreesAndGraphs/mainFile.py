@@ -6,6 +6,8 @@ Created on Dec 26, 2014
 
 from TreesAndGraphs.binaryTree import binarySearchTree
 from random import randrange
+from TreesAndGraphs import BinarySearchTree_IP
+from TreesAndGraphs import treeBasedFunctions
 
 def test_binarySearchTree():
     bst = binarySearchTree(50)
@@ -20,4 +22,17 @@ def test_binarySearchTree():
     bst.searchNode(bst, 33)
     bst.searchNode(bst, 44)
     
-test_binarySearchTree()
+def test_binarySearchTreeIP():
+    mytree = BinarySearchTree_IP.BinarySearchTree()
+    mytree[3]="red"
+    mytree[4]="blue"
+    mytree[6]="yellow"
+    mytree[2]="at"
+
+    print(mytree[6])
+    print(mytree[2])
+    
+#test_binarySearchTree()
+test_binarySearchTreeIP()
+x = treeBasedFunctions()
+x.isTreeBalanced()

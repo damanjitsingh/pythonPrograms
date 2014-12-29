@@ -16,7 +16,7 @@ class binarySearchTree():
         Constructor
         '''
         self.value = value
-        self.leftChild = errorCodes.NULL
+        self.leftChild = None
         self.rightChild = errorCodes.NULL
         
     def searchNode(self,currentNode,value):
