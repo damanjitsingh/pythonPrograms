@@ -4,7 +4,6 @@ Created on Jan 11, 2015
 @author: dsingh
 '''
 import re
-import operator
 
 def findPatterns(fileName):
     fr = open(fileName, 'r')
@@ -39,7 +38,7 @@ def findPatterns(fileName):
             myDict[femaleName] = rank
             
     #Now I need to sort the dict
-    sortTuple = sorted(myDict.items(), key=operator.itemgetter(0))
+    sortTuple = sorted(myDict.items(), key=   (0))
     #finally write tuples to file
     fw.write('\n'.join('%s %s' % t for t in sortTuple))
 

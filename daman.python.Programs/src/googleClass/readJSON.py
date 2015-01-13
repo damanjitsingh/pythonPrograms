@@ -15,6 +15,9 @@ def readFile():
     sortedDataVersion = sorted(data,key = itemgetter('version'))
     pprint(sortedDataVersion)
     
-    
+def main():
+    print 'i am in main'
+    #myfile()
+
 if __name__ == '__main__':
     readFile()
