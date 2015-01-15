@@ -13,16 +13,6 @@ def isUnique(s):
     result = True
     return result
 
-def isUniqueWithSet(s):
-    result = False
-    newStr = set()
-    for c in s:
-        if c in newStr:
-            return result
-        newStr.add(c)
-    result = True
-    return result
-
 def removeDuplicateChars(s):
     newStr = ''
     for c in s:
@@ -37,8 +27,6 @@ def isUniquePythonic(s):
 
 print(isUnique('daman'))
 print(isUnique('damn'))
-print(isUniqueWithSet('daman'))
-print(isUniqueWithSet('damn'))
 print(isUniquePythonic('daman'))
 print(isUniquePythonic('damn'))
 removeDuplicateChars('daman')
