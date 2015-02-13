@@ -6,6 +6,14 @@ Created on Feb 4, 2015
 import sys
 from curses.ascii import isalnum
 
+'''
+Lets learn about filter function! You are given an integer N followed by N email addresses. 
+Your task is to print a list containing valid email addresses, in lexicographic order.
+
+A valid email address is of the format 
+Username can only contain alphabets, digits, dash and underbar. Website name can have alphabets and digits. 
+The extension can no longer be of length more than 3. 
+'''
 
 def validateMail(s):
     l = s.split('@')
