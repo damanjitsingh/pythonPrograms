@@ -1,0 +1,85 @@
+#!/usr/bin/perl -w
+
+# bugdb-to-json
+#
+# Plumbing to read tables from databases on bugs.wolfram.com,
+# and return the data in JSON format.
+# 
+# While ideally this script would be completely ignorant of the database 
+# schema, and dump the rows in a simple structure, it currently creates 
+# a nested mapping hierarchy specific to each supported table, such that 
+# javascript can look up keys quickly without any client-side 
+# preprocessing.
+
+use strict;
+use warnings;
+
+use CGI;
+use JSON;
+use DBI;
+
+# connect to the database
+my $dbh = DBI->connect('DBI:mysql:bugstats:bugsdb.wolfram.com', 'bugs', 'password');
+
+# use HTTP validators (entity tags) to improve caching
+# TODO: handle If-None-Match request header, for this to actually matter
+# TODO: ensure checksum option is enabled in database table's schema
+#my @val = $dbh->selectrow_array('checksum table valid_property_values quick');
+#my $validator = $val[1];
+
+# make HTTP headers
+my %http_headers = (
+    -type          => 'application/javascript',
+    -charset       => 'utf-8',
+    -expires       => '+1d',
+    -Cache_Control => 'max-age=86400',
+#    (defined $validator) ? (-ETag => qq{"$v"}) : (),
+);
+
+my %data;
+
+my $table = CGI::param('table');
+if (not defined $table) {
+    print CGI::header(-status=>400, -type=>'application/javascript');
+    print q{// Error: no 'table' parameter was specified.};
+    exit;
+}
+elsif ($table eq 'valid_property_values') {
+    # pull dataset
+    my $table = $dbh->selectall_arrayref(q;
+        select ReportType, Program, property, value from valid_property_values where active!=0
+    ;);
+
+    # create nested representation of the flat data table
+    foreach my $row (@{$table}) {
+        my ($ReportType, $Program, $property, $value) = @{$row};
+        push @{$data{$property}{$ReportType}{$Program}}, $value;
+    }
+}
+elsif ($table eq 'valid_functional_categories') {
+    # pull dataset
+    my $category_table = $dbh->selectall_arrayref(q;
+        select Program, Component, category from valid_functional_categories
+    ;);
+    
+    # create nested representation of the flat data table
+    foreach my $row (@{$category_table}) {
+        my ($Program, $Component, $category) = @{$row};
+        push @{$data{$Program}{$Component}}, $category;
+    }
+}
+else {
+    print CGI::header(-status=>400, -type=>'application/javascript');
+    print q{// Error: the specified table is not supported.};
+    exit;
+}
+
+my $prefix = CGI::param('jsonp');
+
+print CGI::header(%http_headers);
+if (defined $prefix) {
+    print $prefix, '(', to_json(\%data), ')';
+}
+else {
+    print to_json(\%data);
+}

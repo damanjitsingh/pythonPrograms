@@ -1,0 +1,1764 @@
+#!/usr/bin/python2.4
+
+import os, sys, cgi, re, time, urllib, urlparse, shlex
+#import simplejson as json
+
+sys.path.insert(0, '/math/Admin/sqa/lib/python');
+import General, Databases, Bugs, WebScripts
+from Bug import Bug
+
+# -- should come after sys.path.insert() so it'll use the same lib path
+# -- Otherwise, query_parser.py will add lib path on its own
+from query_parser import parse, normalize_year
+
+#####################################################################
+#   Find bugs by the parameters values 
+#   e.g. findbugs?Status=Open&Priority=1&VersionReported=9.0.0&QAContact=shirald,carlosy
+#   will show version 9.0.0 priority 1 open bugs for which QAContact is either shirald or carlosy.
+#
+#   Single values parameters: (e.g. Status, Priority, etc.)
+#      * 'priority':'1,2'  => priority 1 and priority 2
+#      * 'priority':'!1,2' => neither priority 1 nor priority 2
+#
+#   Multi value parameter: (e.q. QAContact, FunctionalArea, etc.)
+#      * 'QAContact': 'shirald & carlosy' => both  (+ and __and__ are also accepted)
+#      * 'QAContact': 'shirald | carlosy' => one or the other  (comma and __or__ are also accepted)
+#      * 'QAContact': 'shirald - carlosy' => former but not the latter (! and __not__ are also accepted.
+#                                            Spaces must be around '-' to differentiate them from mid word hyphens)
+#
+#   Special characters must be given in url encoded format. __and__, __or__, and __not__ are also accepted for convenience
+#
+#   'reopen':0 - ignore the SeeAlso setting REOPEN_<date>
+#            1 - take union with the 'Status' which means ignored if 'Status' is ignored (all status selected).
+#                Status=Open,Resolved&reopen=1 => open, resolved, or to be reopened.
+#            2 - take the intersection with everything else
+#                {'Status':'Closed', 'reopen':2} => closed and set to be reopened
+#
+#   date_reported, date_resolved, date_resolve_tested or date_closed, last_update or last_updated: can be specified in 
+#                 several forms: e.g. today, yesterday, lastmonth, last30days, thisyear, <date> (yyyymmdd), after<date>, 
+#                 le<date>, between<d1>and<d2> (exclusive), from<d1>to<d2> (inclusive)
+#
+#   count: number of records to show
+#    skip: number of records to skip
+#   lower: smallest bug number
+#   upper: biggest bug number
+#####################################################################
+
+try:
+    SERVER_NAME = os.environ['SERVER_NAME']
+    SCRIPT_NAME = os.environ['SCRIPT_NAME']
+    REQUEST_URI = os.environ['REQUEST_URI']
+    REMOTE_USER = os.environ['REMOTE_USER']
+except KeyError: # -- for command line debugggin
+    SERVER_NAME = os.environ['HOSTNAME']
+    SCRIPT_NAME = sys.argv[0]
+    REQUEST_URI = ' '.join( sys.argv )
+    REMOTE_USER = os.environ['USER']
+
+THIS_YEAR  = time.strftime( "%Y", time.localtime() )
+LAST_YEAR  = str( int(THIS_YEAR) - 1 )
+THIS_MONTH = time.strftime( "%m", time.localtime() )
+NORM_YEAR  = normalize_year( None, THIS_MONTH )
+
+GLOB = {}
+
+def die( mess, ctype='' ):
+    """
+    To conveniently print the error message and exit
+    """
+    if ctype != '': 
+        print "Content-type: text/"+ctype+"\n"
+
+    print mess, "<br/>\n"
+    sys.exit(1)
+
+
+def redirect( link_url, link_text ):
+    """
+    redirects to a given URL
+    """
+    print "Content-type: text/html"
+    print "Location: "+link_url+"\n"
+
+    print "<html><head><title>Redirect</title></head>"
+    print "<body>Please go to <a href='"+link_url+"'>"+link_text+"</a>.</body></html>"
+
+    return 1
+
+
+def print_error_html( msg ):
+    """
+    print error HTML page
+    """
+    print "Content-type: text/html\n"
+
+    start_html()
+    start_page( "Bugs Search Error")
+    print_head()
+
+    print "<div id='error_div'>"+msg+"</div>\n"
+
+    sign_off()
+    end_page()
+    sys.exit(0)
+
+
+def get_general_params( form ):
+    """
+    This gets the general parametes such as count, skip, etc.. those do not
+    have much to do with the bugs themselves. 
+    """
+    params_int = ('count','skip','lower','upper')
+    params_str = ('format','attributes','params','keyword','autokeyword','autostatus','view_as')
+
+    defaults = { 'count':10000, 'skip':0 }
+
+    params = {}
+    for par in params_int: # -- other integer parameters
+        try: params[par] = int( form[ par ].value )
+        except:
+             try:    params[par] = defaults[par]
+             except: params[par] = None
+
+    for par in params_str: # -- other string parameters. Modify if needed
+        try:     params[par] = form[ par ].value
+        except:  params[par] = ''
+
+    return params
+
+
+def get_constraint( form ):
+    """
+    Construct the contraint dictionary based on the query string
+    """
+    # -- note that 'description' or 'problem' actually does an index search in match(summary,description,problem)
+    bug_attrs = ('program','product','versionreported','reporttype','priority','status','summary','problem','description','body','magnitude',
+                 'newbieproject','volunteerproject','puremathproject','resolution','resolutionversion', 'datereported','dateresolved',
+                 'dateresolvetested','dateclosed','lastupdate','lastupdated','component','functionalcategory','functionalarea',
+                 'reportedby','primarydeveloper','projectmanager','qacontact','resolvedby','resolvetestedby','reviewcompletedby',
+                 'seealso','platform','platformaffected','branch','reopen')
+
+
+    general_params     = get_general_params( form )
+    general_param_keys = general_params.keys()
+
+    bug_constr = {}
+    for key in form.keys(): # -- attributes of the bugs to fetch
+        if key in general_param_keys: continue
+
+        key_mod = key.replace('_', '').lower()
+
+        if key_mod not in bug_attrs: 
+            die("Do not know how to handle '"+key+"' yet.", 'html')
+
+        bug_constr[ key_mod ] = form[ key ].value
+        
+    return bug_constr, general_params
+
+
+def get_existing_case_of( dict, key ): # -- might become OBSOLETE, but would be useful to keep around
+    """
+    returns the exact specified case of the key in a dict where keys are 
+    considered case insensitive. e.g. in this tool one may specify 'Status'
+    'status', 'STATUS', etc... only one of them is expected. key='status' 
+    will check for all 'Status', 'STATUS', and returns the first match
+    """
+    oMatch = re.compile( eval("r'^"+key+"$'"), re.IGNORECASE )
+    matched_list = filter( oMatch.match, dict.keys() )
+    try:
+        return matched_list[0]
+    except IndexError:
+        return None
+
+
+def normalize_key_case( constr_dict ):
+    """
+    findbugs sets some default attribute values such as Status and Resolution. This action
+    depends on other attribute values too. To do that we need to access the attribute value
+    setting of the constr_dict without trouble. This fixes the case of attribute names that
+    we need to access. This is not implemented in query_parser for findbugs is the one that
+    sets these default values
+    """
+    attrs_to_fix = ('Resolution','Status')
+    attrs_in_dic = constr_dict.keys()
+
+    attrs_to_fix_map = dict( (x.lower(),x) for x in attrs_to_fix ) # -- { 'status':'Status', ...}
+    attrs_in_dic_map = dict( (x.lower(),x) for x in attrs_in_dic )
+
+    attrs_matched_lower = list( set(attrs_to_fix_map.keys()) & set(attrs_in_dic_map.keys()) ) # -- common attrs
+    if not attrs_matched_lower: return constr_dict
+    
+    for attr in attrs_matched_lower:
+        if attrs_to_fix_map[attr] != attrs_in_dic_map[attr]:
+            constr_dict[ attrs_to_fix_map[attr] ] = constr_dict[ attrs_in_dic_map[attr] ]
+            del constr_dict[ attrs_in_dic_map[attr] ]
+
+    return constr_dict
+
+
+def make_auto_settings( constr_dic ):
+    """
+    We set 'Status':'Open' under certain conditions; when we assume a person would most likely to
+    expect to see only open bugs. This function does that.
+    """
+
+    if GLOB['autostatus']: # -- autostatus overides Status
+        constr_dic['Status'] = GLOB['autostatus']
+
+    try: # -- auto set status
+        if 'all' in constr_dic['Status'].lower():
+            del constr_dic['Status']
+    except KeyError:
+        all_status_attr = ('Resolution','ResolutionVersion','ResolvedBy','ResolveTestedBy','DateResolved','DateResolveTested','LastUpdate')
+        constr_dic_attr = constr_dic.keys()
+
+        all_status_attr_lower = [ x.lower() for x in all_status_attr ]
+        constr_dic_attr_lower = [ x.lower() for x in constr_dic_attr ]
+
+        attr_common = tuple( set(all_status_attr_lower) & set(constr_dic_attr_lower) )
+        if not attr_common:
+            constr_dic['Status'] = 'Open'
+
+    try: # -- auto set Resolution
+        if constr_dic['Resolution'].lower() == 'all':
+            del constr_dic['Resolution']
+    except KeyError:
+        constr_dic['Resolution'] = '!Withdrawn';
+
+
+def find_attr( dbc, value ): # -- May become OBSOLETE
+    """
+    given a value, tries to find the most likely attribute
+    """
+    cur = dbc.cursor()
+    query = "select attribute from attribute_value_index where value='"+value+"' and skip=0 order by score desc limit 1"
+    cur.execute( query )
+
+    try:
+        row = cur.fetchone()
+        return row['attribute']
+    except:
+        return None
+  
+
+def open_log_files():
+    """
+    opens the query parse log. If not exists, create;
+    if exist and small, open for append; if big, rename
+    and open new. Returns [ query_log_fh, failure_log_fh ]
+    """
+    query_log   = "/var/log/bugs/query_parse/queries"
+    failure_log = "/var/log/bugs/query_parse/failures"
+
+    file_handles, size_limit = [], 5*1024*1024
+    for log_file in ( query_log, failure_log ):
+        if not os.path.exists( log_file ): # -- open, if not exist
+            fh = open( log_file, "w" )
+            file_handles.append( fh )
+            continue
+
+        file_size = os.path.getsize( log_file )
+        if file_size < size_limit: # -- if exist and small, append
+            fh = open( log_file, "a" )
+            file_handles.append( fh )
+        else: # -- if big, rename and open new
+            now = time.strftime( "%Y%m%d_%H%M%S", time.localtime() )
+            rename_to = log_file + '.' + now
+            os.rename( log_file, rename_to )
+
+            fh = open( log_file, "w" )
+            file_handles.append( fh )
+
+    return file_handles # -- [ query_log_fh, failure_log_fh ]
+
+
+def prompt_for_keyword_search( dbc, query, message=None ):
+    """
+    when parsing query failed, [prompt to or] automatically do a keyword search
+    """ 
+    REDIRECT_URL = SCRIPT_NAME+'?body='+urllib.quote_plus(query)+'&amp;Resolution=All&amp;Status=Open&amp;autokeyword=1'
+
+    # -- if these words are present in the query, the query is 
+    # -- probably not meant for keyword search. Prompt
+    prompt_words, promptQ = ('my','I','me','on','in','with','within','by','for','whose','a','an','the','as'), False
+    query_tokens = [ x.lower() for x in shlex.split( query ) ]
+    for word in prompt_words:
+        if word.lower() in query_tokens:
+            promptQ = True
+            break
+
+    print "Content-type: text/html\n"
+    start_html()
+
+    if promptQ: start_page( "Bugs Search" )
+    else      : start_page( "Bugs Search", REDIRECT_URL )
+
+    print_head()
+    print_top_menu( dbc )
+    print_query_form()
+
+
+    print "<p id='error'>"
+    if message:
+        print message+"\n</p>\n\n<p>"
+
+    print 'Parsing "' + query + '" failed;'
+    if promptQ: print " do a <a href='"+REDIRECT_URL+"'>keyword search</a>?"
+    else      : print " doing a <a href='"+REDIRECT_URL+"'>keyword search</a>... <button id='stop'>STOP</button>"
+
+    print "</p>"
+
+    sign_off()
+    end_page()
+
+
+def handle_fatal_errors( dbc, query ):
+    """
+    handle clear errors that we cannot deal with.
+    """
+    if re.search( r'(?i)(order|sort)(|ed)\s+by\s+\w', query ):
+        message = "Cannot specify ordering info in the query"
+        prompt_for_keyword_search( dbc, query, message )
+        return 0
+
+    return 1
+
+
+def parse_query( dbc, form, query ):
+    """
+    parse a simple query string and guess what the user means. 
+    """
+    query = query.strip()
+
+    # -- relative url doesn't make the browser display the redirected url
+    SCRIPT_URI_ABS = 'https://'+SERVER_NAME+SCRIPT_NAME 
+
+    if GLOB['keyword']: # -- explicit full body keyword search
+        redirect( SCRIPT_URI_ABS + '?body='+urllib.quote_plus(query)+'&Resolution=All&keyword=1', 'do a keyword search?' )
+    elif GLOB['autokeyword']: # -- full body auto keyword search
+        redirect( SCRIPT_URI_ABS + '?body='+urllib.quote_plus(query)+'&Resolution=All&autokeyword=1', 'do a keyword search?' )
+    elif re.match( r'^\s*(|bug)\s*(|number)\s*\d+\s*$', query ): # -- bug number
+        bugnum = re.sub( r'\D', '', query )
+        redirect( 'https://bugs.wolfram.com/show?number='+bugnum, 'bug '+bugnum )
+    elif re.match( r'(?i)^\s*(key|keyword)\s*:\s*\S.*$', query ): # -- full keyword search using the old script
+        query = re.sub( r'(?i)^\s*(key|keyword)\s*:\s*', '', query, count=1 )
+        redirect( 'https://bugs.wolfram.com/search?term='+urllib.quote_plus(query)+'&show_lines_hit=0', 'search URL' )
+    elif re.match( r'(?i)^\s*(help|\?)\s*$', query ): # -- help
+        redirect( '?mode=help', 'help page' )
+    else: # -- parse free form text query
+        query_log_fh, failure_log_fh = open_log_files()
+        log_stamp = time.strftime( "[%Y-%m-%d %H:%M:%S]", time.localtime() ) + " " + REMOTE_USER
+
+        query_log_fh.write("\n\n")
+        query_log_fh.write( log_stamp + " -\t" + query )
+
+        if not handle_fatal_errors( dbc, query ):
+            query_log_fh.write( "\t" + "***** FATAL ERROR *****" )
+#           failure_log_fh.write( log_stamp + " -\t" + "***** FATAL ERROR *****" + "\tquery: " + query + "\n\n" )
+            failure_log_fh.write( "\n\n" + log_stamp + " -\t" + "***** FATAL ERROR *****" + "\tquery: " + query )
+            sys.exit(0)
+
+        general_params = get_general_params( form )
+
+        try:
+            constr_dic, failed_words = parse( query )
+            query_log_fh.write( "\t" + "===>" + "\t" + str(constr_dic) )
+        except: # -- log if exception caught
+            query_log_fh.write( "\t" + "***** EXCEPTION CAUGHT *****" )
+#           failure_log_fh.write( log_stamp + " -\t" + "***** EXCEPTION CAUGHT *****" + "\tquery: " + query + "\n\n" )
+            failure_log_fh.write( "\n\n" + log_stamp + " -\t" + "***** EXCEPTION CAUGHT *****" + "\tquery: " + query )
+            prompt_for_keyword_search( dbc, query )
+            sys.exit(0)
+
+        not_ok_words = []
+        if failed_words: # -- log if failed to identify words
+            ok_to_fail = ['in','on','for','the','a']
+            not_ok_words = list( set( failed_words ) - set( ok_to_fail ) )
+
+            if not_ok_words: 
+                failure_stamp = "***** UNIDENTIFIED WORDS *****"
+            else: 
+                failure_stamp = "***** UNIDENTIFIED WORDS (Ignored) *****"
+
+            query_log_fh.write( "\t" + failure_stamp + "\t" + str(failed_words) )
+#           failure_log_fh.write( log_stamp + " -\t" + query + "\t" + "===>" + "\t" + str(constr_dic) + "\t" + failure_stamp + "\t" + str(failed_words) + "\n\n" )
+            failure_log_fh.write( "\n\n" + log_stamp + " -\t" + query + "\t" + "===>" + "\t" + str(constr_dic) + "\t" + failure_stamp + "\t" + str(failed_words) )
+
+        query_log_fh.close()
+        failure_log_fh.close()
+
+        if not_ok_words: 
+            prompt_for_keyword_search( dbc, query )
+            sys.exit(0)
+        else:
+            return constr_dic, general_params
+    
+    die( "The script should never reach here.", "html" )
+
+    return {}, {}
+
+
+def start_html():
+    """
+    starts html
+    """
+    print """
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+"""
+
+def start_page( title='', redirect_url='' ):
+    """
+    start the page
+    """
+    print """
+<head>
+  <meta http-equiv="Content-Type" content="application/xhtml+xml; charset=utf-8" />
+"""
+
+    if redirect_url and redirect_url.strip() != '':
+        print "  <meta http-equiv='refresh' content='0; URL="+redirect_url+"'>"
+  
+    print """
+  <link rel="stylesheet" type="text/css" href="../css/bugs.css" />
+  <link rel="stylesheet" type="text/css" href="../css/findbugs.css" />
+
+  <script type="text/javascript" src="../jquery/jquery-1.7.2.min.js"></script>
+  <script type="text/javascript" src="../javascript/bugs.js"></script>
+  <script type="text/javascript" src="../javascript/findbugs.js"></script>
+
+  <style type="text/css">
+    fieldset { border-width:0px }
+    b.all    { color:green }
+  </style>
+
+  <script type="text/javascript">
+    var SCRIPT_NAME = '""" + SCRIPT_NAME + """';
+    var REQUEST_URI = '""" + urllib.quote_plus(REQUEST_URI) + """';
+  </script>
+
+  <title>""" + title + """</title>
+</head>
+<body>
+"""
+
+
+def end_page():
+    """
+    Ends html
+    """
+    print """
+</body>
+</html>
+"""
+
+
+def print_bugs_text( bugs ):
+    """
+    just list the bug links in plain text
+    """
+    print "Content-type: text/plain\n"
+
+    for bug in sorted( bugs, reverse=True ):
+        print WebScripts.ShowBug+'?number='+str(bug)
+
+
+def print_bugs_table( dbc, bugs, constr_dic, orderby='normal' ):
+    """
+    prints the main table of bugs that were found
+    """
+    print "<table id='bugs_main'>"
+    print "  <tr><th>Peek</th><th title='Priority'>Pr</th><th>Bug</th><th>Summary</th><th>Area</th><th>Contact</th></tr>"
+
+    if not bugs:
+        print "</table>"
+        return
+        
+    columns    = 'bug_id as bugn,status,priority,summary'
+    constr     = 'bug_id in (' + ','.join(map(str,bugs)) + ')'
+
+#   order_rule = "field(status, 'Open','Resolved','Closed'), priority, bug_id"
+    order_rule = "bug_id desc"
+
+    # -- no point doing this in boolean mode as the score is always 1 (or 0 for the rest)
+#   if orderby == 'description_score':
+#       try:             value = Bugs._translate_to_boolean( constr_dic['description'] )
+#       except KeyError: value = Bugs._translate_to_boolean( constr_dic['problem'] )
+#       order_rule = "match(summary,description,problem) against('"+value+"' in boolean mode ) desc, " + order_rule
+##      order_rule = "match(summary,description,problem) against('"+value+"' in natural language mode ) desc, " + order_rule
+#   elif orderby == 'summary_score':
+#       value = Bugs._translate_to_boolean( constr_dic['summary'] )
+#       order_rule = "match(summary) against('"+value+"' in boolean mode ) desc, " + order_rule
+##      order_rule = "match(summary) against('"+value+"' in natural language mode ) desc, " + order_rule
+
+    cur = dbc.cursor()
+    query = 'select '+columns+' from current_status where '+constr+' order by '+order_rule
+    cur.execute( query )
+
+    can_edit_priorityQ = Databases.PermittedQ( 'bugstats', 'bugs', 'bugs', 'direct_priority_edit', REMOTE_USER )
+
+    while True:
+        row = cur.fetchone()
+        if not row: break
+
+        bugn, status, priority = str(row['bugn']), row['status'], str(row['priority'])
+
+        peek_td  = "  <td class='nobr'>"
+        peek_td += "    <span class='peeks' entity='attributes' bugn='"+bugn+"'>&Xi;</span>"
+        peek_td += "    <span class='peeks' entity='problem'    bugn='"+bugn+"'>?</span>"
+        peek_td += "  </td>"
+
+        if can_edit_priorityQ:
+            priority_td  = "  <td class='priority p"+priority+"' id='priority_td_"+bugn+"' priority='"+priority+"'>"
+            priority_td += "    <ul class='pdm_parent'>"
+            priority_td += "      <li><span id='priority_"+bugn+"'>"+priority+"</span>"
+            priority_td += "        <ul>"
+            for p in range(1, 6):
+                priority_td += "          <li class='priority_change p"+str(p)+"' bugnumber='"+bugn+"' priority='"+str(p)+"'>"+str(p)+"</li>"
+            priority_td += "        </ul>"
+            priority_td += "      </li>"
+            priority_td += "    </ul>"
+            priority_td += "  </td>"
+        else:
+            priority_td  = "  <td class='p"+priority+"'>" + priority + "</td>"
+
+        bugnum_td  = "<td class='right nobr "+status+"' bugn='"+bugn+"'><a target='_blank' href='/show?number="+bugn+"'>"+bugn+"</a></td>"
+        summary_td = "<td><a class='summary' target='_blank' href='/show?number="+bugn+"'>"+General.escape_xml( row['summary'] )+"</a></td>"
+        area_td    = "<td class='rpad' id='area_"+bugn+"'>...</td>"
+        contact_td = "<td class='rpad' id='cont_"+bugn+"'>...</td>"
+
+        print "<tr>", peek_td, priority_td, bugnum_td, summary_td, area_td, contact_td, "</tr>"
+
+    cur.close()
+    print "</table>"
+
+
+def get_counts_by_func_cat( dbc, user, role ):
+    """
+    gets bug counts by functional categories for the user: returns [[fcat1,count1], [fcat2,count2], ....]
+    """
+    assign_tab_dict = { 'PrimaryDeveloper':'primary_developer_assign', 'ProjectManager':'project_manager_assign', 'QAContact':'qa_contact_assign' }
+    status_dict     = { 'PrimaryDeveloper':'Open', 'ProjectManager':'Open', 'QAContact':'Resolved' }
+
+    try:
+        assign_table = assign_tab_dict[role]
+        status       = status_dict[role]
+    except KeyError:
+        return []
+
+    query = """select  functional_category.name as func_cat, count(bug_id) as bug_count
+               from    (((((current_status left  join functional_category_assign on current_status.bug_id=functional_category_assign.bugnumber) 
+                                          left  join functional_category        on functional_category_assign.functional_category_id=functional_category.id) 
+                                          inner join report_type                on current_status.report_type_id=report_type.id) 
+                                          inner join resolution                 on current_status.resolution_id=resolution.id) 
+                                          inner join """+assign_table+"""       on current_status.bug_id="""+assign_table+""".bugnumber) 
+                                          inner join person                     on """+assign_table+""".person_id=person.id 
+               where current_status.status='"""+status+"""' and report_type.name not in ('Feature','Suggestion') and 
+                     resolution.name!='Withdrawn' and person.name='"""+user+"""' 
+               group by func_cat order by bug_count desc"""
+
+    cur = dbc.cursor()
+    cur.execute( query )
+
+    min, max = 30, 3000 # -- don't categorize if 30 > total > 3000
+
+    func_cats, i, total, the_rest = [], 0, 0, 0
+    while True:
+        row = cur.fetchone()
+        if row is None: break
+
+        i += 1
+        if row['func_cat'] is None: row['func_cat'] = "None"
+        total +=  row['bug_count']
+
+        if total > max: break
+
+        if i > 5: the_rest += row['bug_count']
+        else    : func_cats.append( [row['func_cat'], row['bug_count']] )
+
+    cur.close()
+
+    if total < min or total > max: 
+        return []
+    else:
+        if the_rest: func_cats.append( ['Other', the_rest] )
+        return func_cats
+
+
+def print_by_func_cat_links( by_func_cat, user_role ):
+    """
+    prints "By Functional Category" links of "My Bugs" menu.
+    by_func_cat takes form, [[fcat1,count1], [fcat2,count2], ....['Other',count]]
+    """
+    fcat_rest = [] # -- func cats except 'Other'. 'Other' === '!fcat1,fcat2,...'
+    for fcat_count in by_func_cat: 
+        fcat, count = fcat_count
+        if fcat != 'Other': fcat_rest.append( fcat )
+
+    if user_role == 'QAContact': status = 'Resolved'
+    else:                        status = 'Open'
+
+    print "<li>By Functional Category</li>"
+       
+    for fcat_count in by_func_cat:
+        fcat, count = fcat_count
+
+        if fcat == 'Other': fcat_url = '!'+','.join( fcat_rest )
+        else:               fcat_url = fcat
+
+        url = SCRIPT_NAME+"?"+user_role+"="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status="+status+"&amp;FunctionalCategory="+fcat_url
+        print "        <li><a href='"+url+"'>&nbsp; &nbsp;"+fcat+"</a> ("+str(count)+")</li>"
+
+
+def print_my_bugs_submenu( dbc ):
+    """
+    print the submenu "My Bugs" accroding to the rol: PrimaryDeveloper, QAContact, or ProjectManager, of the user
+    """
+    user_role = GLOB['user_role']
+    if user_role is None or user_role == "": return
+
+    by_func_cat = get_counts_by_func_cat( dbc, REMOTE_USER, user_role )
+
+    print "  <li>"
+    print "      My Bugs"
+    print "      <ul>"
+
+    if user_role == "PrimaryDeveloper":
+        print "        <li><a href='"+SCRIPT_NAME+"?PrimaryDeveloper="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status=Open&amp;Priority=0'>Unprioritized Open Bugs</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?PrimaryDeveloper="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status=Open&amp;Priority=1'>Priority 1 Open Bugs</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?PrimaryDeveloper="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status=Open&amp;Priority=1,2'>Priority 1 &amp; 2 Open Bugs</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?PrimaryDeveloper="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status=Open'>Open Bugs</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?ReportedBy="+REMOTE_USER+"&amp;ReportType=Bug&amp;DateReported=last30days'>I Reported Lately</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?ResolvedBy="+REMOTE_USER+"&amp;ReportType=Bug&amp;DateResolved=lastmonth'>I Resolved Last Month</a></li>"
+        if by_func_cat: print_by_func_cat_links( by_func_cat, user_role )
+        print "        <li><a href='"+SCRIPT_NAME+"?PrimaryDeveloper="+REMOTE_USER+"&amp;ReportType=Feature&amp;Status=Open'>Open Features</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?PrimaryDeveloper="+REMOTE_USER+"&amp;ReportType=Suggestion&amp;Status=Open'>Open Suggestions</a></li>"
+    elif user_role == "QAContact":
+        print "        <li><a href='"+SCRIPT_NAME+"?QAContact="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status=Resolved&amp;Priority=1,2'>Priority 1 &amp; 2 Resolved Bugs</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?QAContact="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status=Resolved'>Resolved Bugs</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?ReportedBy="+REMOTE_USER+"&amp;ReportType=Bug&amp;DateReported=last30days'>I Reported Lately</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?ResolveTestedBy="+REMOTE_USER+"&amp;ReportType=Bug&amp;DateClosed=lastmonth'>I Closed Last Month</a></li>"
+        if by_func_cat: print_by_func_cat_links( by_func_cat, user_role )
+    elif user_role == "ProjectManager":
+        print "        <li><a href='"+SCRIPT_NAME+"?ProjectManager="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status=Open&amp;Priority=0'>Unprioritized Open Bugs</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?ProjectManager="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status=Open&amp;Priority=1'>Priority 1 Open Bugs</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?ProjectManager="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status=Open&amp;Priority=1,2'>Priority 1 &amp; 2 Open Bugs</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?ProjectManager="+REMOTE_USER+"&amp;ReportType=Bug&amp;Status=Open'>Open Bugs</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?ReportedBy="+REMOTE_USER+"&amp;ReportType=Bug&amp;DateReported=last30days'>I Reported Lately</a></li>"
+        if by_func_cat: print_by_func_cat_links( by_func_cat, user_role )
+        print "        <li><a href='"+SCRIPT_NAME+"?ProjectManager="+REMOTE_USER+"&amp;ReportType=Feature&amp;Status=Open'>Open Features</a></li>"
+        print "        <li><a href='"+SCRIPT_NAME+"?ProjectManager="+REMOTE_USER+"&amp;ReportType=Suggestion&amp;Status=Open'>Open Suggestions</a></li>"
+    else:
+        print "        <li>*** Error ***</li>"
+
+    print "      </ul>"
+    print "  </li>"
+
+
+def print_top_menu( dbc, main_page=False ):
+    """
+    prints the top navigation menu
+    """
+    print "<div id='topmenu'>"
+
+    print "<ul>"
+    print "  <li><a href='/'>Bugs Home</a></li>"
+    print "  <li><a href='/find'>Find Bugs</a></li>"
+    print_my_bugs_submenu( dbc )
+    print "  <li>"
+    print "      Mathematica"
+    print "      <ul>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=Mathematica&amp;ReportType=Bug&amp;Status=Open&amp;PrimaryDeveloper=none'>Unassigned Open Bugs</a></li>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=Mathematica&amp;ReportType=Bug&amp;Status=Open&amp;Priority=0'>Unprioritized Open Bugs</a></li>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=Mathematica&amp;ReportType=Bug&amp;Status=Open&amp;Priority=1'>Priority 1 Open Bugs</a></li>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=Mathematica&amp;ReportType=Bug&amp;Status=Open&amp;Priority=1,2'>Priority 1 &amp; 2 Open Bugs</a></li>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=Mathematica&amp;ReportType=Bug&amp;DateReported=today'>Bugs Reported Today</a></li>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=Mathematica&amp;ReportType=Bug&amp;DateResolved=today'>Bugs Resolved Today</a></li>"
+    print "        <li>Tag Move</li>"
+    print "        <li>&nbsp; &nbsp;<a href='"+SCRIPT_NAME+"?SeeAlso=TAGMOVE_REQUESTED&amp;Program=Mathematica'>Requested</a></li>"
+    print "        <li>&nbsp; &nbsp;<a href='"+SCRIPT_NAME+"?SeeAlso=TAG_MOVED&amp;Program=Mathematica&amp;Status=Resolved'>Moved and Resolved</a></li>"
+    print "        <li>&nbsp; &nbsp;<a href='"+SCRIPT_NAME+"?SeeAlso=TAG_MOVED&amp;Program=Mathematica&amp;LastUpdate=last7days'>Moved and Updated Lately</a></li>"
+    print "        <li>&nbsp; &nbsp;<a href='"+SCRIPT_NAME+"?SeeAlso=TAGMOVE_REJECTED&amp;Program=Mathematica&amp;LastUpdate=last7days'>Rejected and Updated Lately</a></li>"
+    print "      </ul>"
+    print "  </li>"
+    print "  <li>"
+    print "      Wolfram|Alpha"
+    print "      <ul>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=WolframAlpha&amp;ReportType=Bug&amp;Status=Open&amp;PrimaryDeveloper=none'>Unassigned Open Bugs</a></li>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=WolframAlpha&amp;ReportType=Bug&amp;Status=Open&amp;Priority=0'>Unprioritized Open Bugs</a></li>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=WolframAlpha&amp;ReportType=Bug&amp;Status=Open&amp;Priority=1'>Priority 1 Open Bugs</a></li>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=WolframAlpha&amp;ReportType=Bug&amp;Status=Open&amp;Priority=1,2'>Priority 1 &amp; 2 Open Bugs</a></li>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=WolframAlpha&amp;ReportType=Bug&amp;DateReported=today'>Bugs Reported Today</a></li>"
+    print "        <li><a href='"+SCRIPT_NAME+"?Program=WolframAlpha&amp;ReportType=Bug&amp;DateResolved=today'>Bugs Resolved Today</a></li>"
+    print "        <li>Tag Move</li>"
+    print "        <li>&nbsp; &nbsp;<a href='"+SCRIPT_NAME+"?SeeAlso=TAGMOVE_REQUESTED&amp;Program=WolframAlpha'>Requested</a></li>"
+    print "        <li>&nbsp; &nbsp;<a href='"+SCRIPT_NAME+"?SeeAlso=TAG_MOVED&amp;Program=WolframAlpha&amp;Status=Resolved'>Moved and Resolved</a></li>"
+    print "        <li>&nbsp; &nbsp;<a href='"+SCRIPT_NAME+"?SeeAlso=TAG_MOVED&amp;Program=WolframAlpha&amp;LastUpdate=last7days'>Moved and Updated Lately</a></li>"
+    print "        <li>&nbsp; &nbsp;<a href='"+SCRIPT_NAME+"?SeeAlso=TAGMOVE_REJECTED&amp;Program=WolframAlpha&amp;LastUpdate=last7days'>Rejected and Updated Lately</a></li>"
+    print "      </ul>"
+    print "  </li>"
+    print "  <li><a href='"+SCRIPT_NAME+"?SeeAlso=TAGMOVE_REQUESTED'>Tag Move Requests</a></li>"
+    print "  <li><a href='/report'>Report a Bug</a></li>"
+    print "  <li><a href='/report?ReportType=Feature'>Add a Feature</a></li>"
+    if not main_page:
+#       print "  <li><a href='"+urllib.quote_plus(REQUEST_URI)+"&amp;format=text'>Bugs List</a></li>"
+        print "  <li><a href='"+REQUEST_URI+"&amp;format=text'>Bugs List</a></li>"
+    print "</ul>"
+
+    print "</div>"
+   
+def print_query_main_page( dbc ):
+    """
+    prints a main front page with only the single free from query search field
+    """
+    print "Content-type: text/html\n"
+
+    start_html()
+    start_page("Bugs Search")
+    print_top_menu( dbc, main_page=True )
+
+    print_query_form( head=True )
+
+    print "<div id='bottom'>"
+    sign_off()
+    print "</div>"
+    end_page()
+
+
+def print_query_help_page( dbc ):
+    """
+    print the detailed query help page
+    """
+    print "Content-type: text/html\n"
+
+    start_html()
+    start_page("Bugs Search")
+    print_head()
+    print_top_menu( dbc )
+    print_query_form()
+
+    print "<div style='margin-top:4em; margin-bottom:3em'>"
+
+    print """
+
+<h2>Contents</h2>
+<ol>
+  <li><a href='#overview'>Overview</a></li>
+  <li><a href='#username'>Intepretation of usernames</a></li>
+  <li><a href='#forcing'>Hinting and forcing a role/attribute on a username/value</a></li>
+  <li><a href='#self'>Self-referencing</a></li>
+  <li><a href='#version'>Intepretation of version sepcificatons</a></li>
+  <li><a href='#dates'>Specifying dates and date ranges</a></li>
+  <li><a href='#case'>Case sensitivity</a></li>
+  <li><a href='#keyword'>Searching in summary, problem description, and full text body</a></li>
+  <li><a href='#keyword_only'>Keyword search on its own</a></li>
+  <li><a href='#negation'>Negation on single value attributes</a></li>
+  <li><a href='#setops'>Set operations on multi-value attributes</a></li>
+  <li><a href='#related'>Finding related bugs</a></li>
+  <li><a href='#aliases'>Aliases</a></li>
+<!-- <li><a href='#body'>Full text body keyword search</a></li> -->
+  <li><a href='#future'>Future plans</a></li>
+</ol>
+
+<!--
+<div id='notice'>
+<h3>Note</h3>
+<p>
+Based on feedback, the script has been modified to make an attempt to auto set status when not specified. 
+For some queries, only open bugs are shown, For some others, all the bugs are shown.
+</p><p>
+Please bear with me while I update the help page to be consistent with this change.
+</p>
+</div>
+-->
+
+<h3 id='overview'>Overview</h3>
+<p>
+This search tool helps find bugs by submitting a less structured query phrase to the server. The goal 
+is to make finding bugs easier by providing functionality to parse simple queries to do typical bug searches 
+that are performed everyday. The tool attempts to segment the query and match them with bug attribute values.
+Though this has some keyword search capabilities (see below), this is not a general keyword search tool.
+</p><p>
+Following is a list of examples to illustrate how to use this tool. Once the list of bugs is loaded, 
+one may roll the mouse pointer over the word "query" on top left of the page to check the 
+interpretation of the query. By clicking it, one can load the page with the normalized query.
+</p>
+"""
+    print "<table class='query_examples'>"
+    print "  <tr><th>query</th><th>interpretation</th></tr>"
+    print "  <tr>"
+    query = "Mathematica bugs filed today"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'Mathematica', 'ReportType':'Bug', 'DateReported':'today'}</td>"
+    print "  </tr><tr>"
+    query = "DatabaseLink priority 1 and 2 bugs"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'FunctionalCategory':'DatabaseLink', 'Priority':'1,2', 'ReportType':'Bug'}</td>"
+    print "  </tr><tr>"
+    query = "WolframAlpha unassigned open reports"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'WolframAlpha', 'PrimaryDeveloper':'none', 'Status':'Open'}</td>"
+    print "  </tr><tr>"
+    query = "Mathematica unprioritized open bugs"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'Mathematica', 'Priority':'0', 'Status':'Open', 'ReportType':'Bug'}</td>"
+    print "  </tr><tr>"
+    query = "WolframAlpha features whose manager unknown"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'WolframAlpha', 'ReportType':'Feature', 'ProjectManager':'none'}</td>"
+    print "  </tr><tr>"
+    query = "externally reported DatabaseLink open bugs"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ReportedBy':'external', 'FunctionalCategory':'DatabaseLink', 'Status':'Open', 'ReportType':'Bug'}</td>"
+    print "  </tr><tr>"
+    query = "Mathematica and WolframDesktop open tag move requests"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'Mathematica,WolframDesktop', 'Status':'Open', 'SeeAlso':'TAGMOVE_REQUESTED'}</td>"
+    print "  </tr><tr>"
+    query = "p1,2 open bugs tagged CNFeedback"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Priority':'1,2', 'Status':'Open', 'ReportType':'Bug', 'SeeAlso': 'CNFeedback'}</td>"
+    print "  </tr><tr>"
+    query = "Open Symbolics EricWCheck reports"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Status': 'Open', 'FunctionalCategory': 'Symbolics', 'SeeAlso': 'EricWCheck'}</td>"
+    print "  </tr>"
+    print "</table>"
+
+    print """
+<p>
+The functionality is limited to searching; no control over how the bugs are
+displayed. They are always displayed as a list sorted from latest to the oldest and the information 
+brought upfront are fixed. By default the script shows only the bugs that are not withdrawn <em>(Resolution:!Withdrawn)</em>.
+If one wishes the withdrawn bugs to be included in the list, one may request for <em>all</em> bugs: <em>e.g.</em>
+"""
+
+    print "<a href='"+SCRIPT_NAME+"?query=all visualization 10.0.0 bugs'>all visualization 10.0.0 bugs</a>",
+    print "compared to",
+    print "<a href='"+SCRIPT_NAME+"?query=visualization 10.0.0 bugs'>visualization 10.0.0 bugs</a>",
+
+    print "</p><p>\nGiven how it works,",
+
+    print "<a href='"+SCRIPT_NAME+"?query=priority 1,2,3 open Integrate bugs'>priority 1,2,3 open Integrate bugs</a>",
+    print "is far less likely to fail than",
+    query = "bugs in Integrate whose priority is 1, 2, or 3 and status is open"
+    print "<a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a>;"
+    print "the more English grammar it has to resolve, the more likely it is to fail. A query such as"
+    query = "show me the list of bugs in Integrate whose priority is 1, 2, or 3 and status is open"
+    print "<a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a>"
+    print "will certainly fail for there is no functionality implemented to parse that kind of constructs."
+    print "</p>\n"
+
+
+    print """
+<h3 id='username'>Intepretation of usernames</h3>
+<p>
+When attempting to segment the query and identify words (tokenizing), a username is attempted to be identified as either a developer, manager,
+tester, or a reporter. The first three categories are tried in the order the relevance. e.g. <em>eilas</em> will be identified as a manager
+rather than a developer and <em>ninad</em> is identified as a developer rather than a tester though they have also performed the other
+role. The last category is tried only if the first three have failed. If the first name or the last name of a person is specified, an attempt is
+made to figure out the username. The odds of success for such attempts are higher for uncommon names compared to those for common names. 
+Noise in the database also contributes to failures. If all attempts failed, parsing query fails.
+</p>
+"""
+    print "<table class='query_examples'>"
+    print "  <tr>"
+    query = "ninad open NIntegrate bugs"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'PrimaryDeveloper':'ninad', 'Status':'Open', 'FunctionalArea':'NIntegrate', 'ReportType':'Bug'}</td>"
+    print "  </tr><tr>"
+    query = "eilas open p1 and p2 WolframAlpha features"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ProjectManager':'eilas', 'Status':'Open', 'Priority':'1,2', 'Program':'WolframAlpha', 'ReportType':'Feature'}</td>"
+    print "  </tr><tr>"
+    query = "carlosy resolved bugs"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'QAContact':'carlosy', 'Status':'Resolved', 'ReportType':'Bug'}</td>"
+    print "  </tr><tr>"
+    query = "bugs carlosy resolved"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ReportType':'Bug', 'ResolvedBy':'carlosy'}</td>"
+    print "  </tr><tr>"
+    query = "bugs Rachelle closed last 3 months"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ReportType': 'Bug', 'ResolveTestedBy': 'rbergman', 'DateResolveTested': 'last3months'}</td>"
+    print "  </tr><tr>"
+    query = "tokarek reports"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ReportedBy':'tokarek'}</td>"
+    print "  </tr><tr>"
+    query = "janed reports"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>**** FAILS ****</td>"
+    print "  </tr>"
+    print "</table>"
+
+    print """
+<p>
+This functionality tends to fail when the user is <em>bugs</em>. e.g.
+"""
+    query = "bugs resolved by bugs last year"
+    print "<a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a>"
+    print """
+works, but at times, the parser fails to differentiate the user <em>bugs</em> from bugs: the reports. 
+Nevertheless, this can be improved if needed. 
+</p>
+"""
+
+    print """
+<h3 id='forcing'>Hinting and forcing a role on a username (applies to other attributes/values as well)</h3>
+<p>
+As of August 2014, <em>rknapp</em> is auto-identified as a developer. One can say "<em>manager rknapp</em>" to hint the parser to take 
+<em>rknapp</em> as a manager. The script still tries to identify the terms <em>manager</em> as an [alias to an] attribute and 
+<em>rknapp</em> as a username. On the other hand, if one says "<em>manager:rknapp</em>", no identification is attempted; 
+the setting is forced. This can be done with other attributes/values as well.
+</p>
+"""
+    print "<table class='query_examples'>"
+    print "  <tr>"
+    query = "rknapp p1,2 open NIntegrate bugs"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'PrimaryDeveloper':'rknapp', 'Priority':'1,2', 'Status':'Open', 'FunctionalArea':'NIntegrate', 'ReportType':'Bug'}</td>"
+    print "  </tr><tr>"
+    query = "manager rknapp p1,2 open NIntegrate bugs"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a> <em class='help'>&ndash; manager rknapp is hinted</em></td>"
+    print "    <td rowspan='2'>{'ProjectManager':'rknapp', 'Priority':'1,2', 'Status':'Open', 'FunctionalArea':'NIntegrate', 'ReportType':'Bug'}</td>"
+    print "  </tr><tr>"
+    query = "manager:rknapp p1,2 open NIntegrate bugs"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a> <em class='help'>&ndash; manager:rknapp is forced</em></td>"
+    print "  </tr>"
+    print "</table>"
+
+    print """
+<h3 id='self'>Self-referencing</h3>
+<p>
+One can also use phrases such as <em>"bugs I filed last 2 weeks"</em> or <em>"my open p1 bugs"</em>. Such self-referring words as "I", "my", etc. are 
+taken as the logged-in user. However, the query fails if the logged-in user cannot be found in the database as a developer, manager, tester or a reporter.
+</p>
+"""
+    print "<table class='query_examples'>"
+    print "  <tr>"
+    query = "bugs I filed last 2 weeks"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ReportType':'Bug', 'ReportedBy':'"+REMOTE_USER+"', 'DateReported':'last2weeks'}</td>"
+    print "  </tr><tr>"
+    query = "my open p1 bugs"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'&lt;relevant_role&gt;':'"+REMOTE_USER+"', 'Status':'Open', 'Priority':'1', 'ReportType':'Bug'}</td>"
+    print "  </tr>"
+    print "</table>"
+
+
+    print """
+<h3 id='version'>Intepretation of version sepcificatons</h3>
+<p>
+When not explicitly specified, the target version attribute for features is taken to be ResolutionVersion whereas for 
+bugs and suggestions VersionReported is assumed. If the version specification is "10.0", reports with any 10.0.x are selected. 
+Just "10" on its own will fail for any integer by itself is not assumed to be a version specification; in such case, 
+one has to specify it as <em>"V10"</em>. Inequalities such as <em>"version &gt; 10.0.1"</em> are also interpreted accordingly.
+</p>
+""" 
+    print "<table class='query_examples'>"
+    query = "Mathematica 10.0 p1 open bugs"
+    print "    <tr><td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td><td>VersionReported is taken as 10.0.x</td></tr>"
+    query = "Mathematica 9 p1 closed bugs"
+    print "    <tr><td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td><td>**** FAILS **** cannot interpret 9 on its own</td></tr>"
+    query = "Mathematica version 10 p1 open bugs"
+    print "    <tr><td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td><td>VersionReported is taken as 10.x.x</td></tr>"
+    query = "Mathematica V10 p1 open features"
+    print "    <tr><td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td><td>ResolutionVersion is taken as 10.x.x</td></tr>"
+    query = "Mathematica bugs whose version > 10.0.1"
+    print "    <tr><td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+General.escape_xml(query)+"</a></td><td>{'VersionReported':'&gt;10.0.1', ...}</td></tr>"
+    query = "Mathematica p1 bugs resolved since 10.0.1"
+    print "    <tr><td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+General.escape_xml(query)+"</a></td><td>{'ResolutionVersion':'&ge;10.0.1', ...}</td></tr>"
+    print "</table>"
+
+    print """
+<h3 id='dates'>Specifying dates and date ranges</h3>
+<p>
+A date specification can be given in a few forms. The direct way is to just give it in the form
+<em>"20140710"</em> (specific date) or <em>"20140710-20140710"</em> (a date range). Other forms
+such as <em>"in July[, 2014]"</em>, <em>"from Jan 1 to Jan 15"</em>, <em>"last month"</em>, or
+<em>"last 30 days"</em> are translated either by the parser of by the underlying search script.
+If the year is not specified and the month is a previous month (e.g. say <em>"in June"</em> in June 
+or later), the current year is assumed; otherwise (e.g. say <em>"in June"</em> in May or earlier),
+the previous year is assumed. <em>"last month"</em> and <em>"last 30 days"</em> are different 
+in the sense that the former is interpreted as the last calendar month rather than the last 30 days.
+One can specify months in short (e.g. Jan) or long (e.g. January) form, but one may not mix different 
+forms.
+</p>
+"""
+    last_Wed = Databases.GetLastWeekday( "Wednesday" )
+
+    print "<table class='query_examples'>"
+    print "  <tr>"
+    query = "bugs I filed on July 10th"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ReportType':'Bug', 'ReportedBy':'"+REMOTE_USER+"', 'DateReported':'"+str(THIS_YEAR)+"0710'}</td>"
+    print "  </tr><tr>"
+    query = "bugs filed on 20140710"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ReportType':'Bug', 'DateReported':'20140710'}</td>"
+    print "  </tr><tr>"
+    query = "Parser bugs resolved on 7/10"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Component':'Parser', 'ReportType':'Bug', 'DateResolved':'"+str(NORM_YEAR)+"0710', 'Resolution':'!Withdrawn'}</td>"
+    print "  </tr><tr>"
+    query = "bugs iliang closed in July"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ReportType':'Bug', ResolveTestedBy':'iliang', 'DateResolveTested':'"+str(NORM_YEAR)+"0701-"+str(NORM_YEAR)+"0731'}</td>"
+    print "  </tr><tr>"
+    query = "Mathematica bugs resolved since last Wednesday"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'Mathematica', 'ReportType':'Bug', DateResolved':'since"+last_Wed+"'}</td>"
+    print "  </tr><tr>"
+    query = "Mathematica version 10.0.1 bugs resolved last 30 days"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'Mathematica', 'VersionReported':'10.0.1', 'ReportType':'Bug', 'DateResolved':'last30days'}</td>"
+    print "  </tr><tr>"
+    query = "Mathematica bugs resolved from Feb 1 to Feb 15 2013"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'Mathematica', 'ReportType':'Bug', 'DateResolved':'from20130201to20130215'}</td>"
+    print "  </tr><tr>"
+    query = "Mathematica bugs fixed from Feb 1 to Feb 15 2013"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'Mathematica', 'ReportType':'Bug', 'DateResolved':'from20130201to20130215', 'Resolution':'Fixed'}</td>"
+    print "  </tr><tr>"
+    query = "WolframAlpha parser bugs updated within the last 7 days"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'LastUpdate': 'last7days', 'Program': 'WolframAlpha', 'Component': 'parser', 'ReportType': 'bug'}</td>"
+    print "  </tr>"
+    print "</table>"
+
+    print """
+<h3 id='case'>Case sensitivity</h3>
+<p>
+Most bug attributes are stored case insensitive, but FunctionalArea are FunctionalCategory are not. For such values,
+an attempt is made to fix the case if an exact match cannot be found, but it could fail when there are multiple possibilities 
+(often as a result of mistyping). 
+</p><p>
+If <em>abc</em> was entered and only <em>Abc</em> exists then <em>Abc</em> is selected, but if the entered 
+value, in this case <em>abc</em>, exists, then that is selected. If multiple values none of which is the entered
+value exist, the one lexically at the top (in an attempt to pick the capitalized word) is selected.
+</p>
+"""
+
+    print """
+<h3 id='keyword'>Searching in summary, problem description, and full text body</h3>
+<p>
+A keyword search can be done in summary, summary and problem description as a whole (referred to as <em>problem</em>
+or <em>description</em> in search queries), or full text body of the bug data file that includes follow-up comments. 
+A simple wildcard pattern search can also be performed on summary, but not on problem description or the text body. 
+Since the keywords given to be searched by in summary, summary/problem description, or the body can be any text, 
+the parser requires a description head and an ending hint to mark the beginning and the end of the segment. 
+</p>
+
+<p>
+Valid description heads are:
+</p>
+<ul>
+  <li><em>"summary:"</em> tells it to do a keyword search in summary</li>
+  <li><em>"problem:"</em> do so in summary and problem description as a whole</li>
+  <li><em>"description:"</em> is the same as <em>"problem:"</em></li>
+  <li><em>"body:"</em> tells it to do a keyword search in full text body that includes follow-up comments</li>
+  <li><em>"summary:~"</em> tells it to do a simple wildcard pattern search in summary</li>
+</ul>
+<p>
+There are three ways to specify the end of the search phrase: 
+</p>
+<ol>
+  <li>specify the summary, problem, or body search phrase at the end of the query,</li>
+  <li>end the summary, problem, or body search phrase with '--',</li>
+  <li>or at the end of the summary, problem, or body search phrase, force another specification; 
+      e.g. <em>"Program:WolframAlpha"</em> so as to hint the breaking point.</li>
+</ol>
+
+<p>
+Words shorter than four letters are not indexed by MySQL by default. So, one cannot do a keyword search by such short words; 
+nevertheless, a pattern search can still be performed on summary.
+</p><p>
+Follow up comments of bugs are not stored in MySQL. So, we turn to Glimpse to search by keywords in the full text
+body of the bug data file. When a keyword search in the body is specified, the tool by default first performs a 
+case insensitive whole word keyword search with Glimpse limited to a maximum number of 1000 hits; that set is then
+narrowed down using MySQL according to the rest of the constraints. To keep some resemblance in keyword search syntax, 
+the tool translates MySQL keyword search logical operators to those of Glimpse, nevertheless, it by no means attempts 
+to do a full translation. One may still try Glimpse syntax in the <em>body</em> query phrase in order to harness the 
+power of Glimpse.
+</p><p>
+The default settings: case insensitive, whole word, and initial 1000 maximum matches can be changed if necessary using 
+<em>cs</em> (case sensitive), <em>pw</em> (partial word), and <em>number</em> flags withing brackets 
+(one or all three flags) at the beginning of the search phrash e.g. <em>[cs,pw,2000]</em>. However, the limit
+on the number of glimpse hits may not exceed 5000.
+</p>
+"""
+    print "<table class='query_examples'>"
+    print "  <tr>"
+    query = "WolframAlpha reports with summary:+Hurricane +Location"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td rowspan='4'>{'Program': 'WolframAlpha', 'summary': '+Hurricane +Location'} <em class='help'>&ndash; keyword search in summary</em></td>"
+    print "  </tr><tr>"
+    query = "WolframAlpha summary:+Hurricane +Location"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "  </tr><tr>"
+    query = "summary:+Hurricane +Location -- WolframAlpha"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "  </tr><tr>"
+    query = "summary:+Hurricane +Location Program:WolframAlpha"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "  </tr><tr>"
+    query = "WolframAlpha bugs whose summary contains GivenName"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'WolframAlpha', 'ReportType':'Bug', 'summary':'GivenName'} <em class='help'>\"summary contains\" is taken as keyword search in summary</em></td>"
+    print "  </tr><tr>"
+    query = "summary:~ Do[*] -- Open"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Status': 'Open', 'summary': '~Do[*]'} <em class='help'>&ndash; search for the pattern Do[*] in summary</em></td>"
+    print "  </tr><tr>"
+    query = "problem:+Hurricane +Location Program:WolframAlpha"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td rowspan='2'>{'Program': 'WolframAlpha', 'problem': '+Hurricane +Location'} <em class='help'>&ndash; keyword search in summary and problem description</em></td>"
+    print "  </tr><tr>"
+    query = "description:+Hurricane +Location -- WolframAlpha"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "  </tr><tr>"
+    query = 'body:"distinct prime factors"'
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'body':'&quot;distinct prime factors&quot;'} <em class='help'>search for the phrase</em></td>"
+    print "  </tr><tr>"
+    query = "WolframAlpha open body:+facebook -distribution"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'WolframAlpha', 'Status':'Open', 'body':'+facebook -distribution'} <em class='help'>match facebook, but not distribution</em></td>"
+    print "  </tr><tr>"
+    query = "WolframAlpha open body:[pw,2000]+facebook +distribution"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td><em class='help'>partial words matched and starts with a 2000 maximum glimpse hits; will match FacebookUserData, AgeDistributionData, etc.</em></td>"
+    print "  </tr><tr>"
+    query = "WolframAlpha body:[cs]Caterpillar"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td><em class='help'>case sensitive and meant to target the company; not the insect</em></td>"
+    print "  </tr>"
+    print "</table>"
+
+    print """
+<h3 id='keyword_only'>Keyword search on its own</h3>
+<p>
+One can skip parsing the query all together and do a full text keyword search by checking the box <em>keyword search</em>
+to the right of the query text field. The keyword search behavior is exactly the same as that when <em>"body:"</em> tag 
+is specified in a parsed query; only there are no additional constraints. The selection stays for the subsequent searches.
+One may also opt to do a case sensitive and/or partial word matching and/or change the maximum number of Glimpse hits. 
+See <a href='#keyword'>Searching in summary, problem description, and full text body</a> for details.
+</p>
+"""
+    print "<table class='query_examples'>"
+    print "  <tr>"
+    query = "+CERN +Collider"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"&amp;Resolution=All&amp;keyword=1'>"+query+"</a></td>"
+    print "    <td><em class='help'>only keyword search on the full text body</em></td>"
+    print "  </tr><tr>"
+    query = "[cs,pw]+CERN +Collider"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"&amp;Resolution=All&amp;keyword=1'>"+query+"</a></td>"
+    print "    <td><em class='help'>case sensitive partial word match</em></td>"
+    print "  </tr>"
+    print "</table>"
+
+    print """
+<h3 id='negation'>Negation on single value attributes</h3>
+<p>
+One can negate a value with '!'. e.g. <em>"Status:!Closed"</em> will search for reports that are not
+closed; <em>"Priority:!0,5"</em> is equivalent to <em>"Priority:1,2,3,4"</em>. This applies only to
+single value attributes such as Status, Priority, etc. (see below for how it is done for multi-value
+attributes such as PrimaryDeveloper). The parser can parse query phrases such as 
+<em>"priority 1 Visualization bugs whose status is not closed"</em>, but using a forced description
+such as <em>"Status:!Closed"</em> might prove to be safer when a negation is needed.
+</p>
+"""
+    print "<table class='query_examples'>"
+    print "  <tr>"
+    query = "reports that chadk resolved whose report type is not feature"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a> <em class='help'>&ndash; works, but such is fragile</em></td>"
+    print "    <td rowspan='3'>{'ReportType':'!Feature', 'ResolvedBy':'chadk'}</td>"
+    print "  </tr><tr>"
+    query = "non features chadk resolved"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a> <em class='help'>&ndash; safer</em></td>"
+    print "  </tr><tr>"
+    query = "reports chadk resolved ReportType:!Feature"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a> <em class='help'>&ndash; safest</em></td>"
+    print "  </tr>"
+    print "</table>"
+
+    print """
+<h3 id='setops'>Set operations on multi-value attributes</h3>
+<p>
+A few set operations are performed on multi-value attributes such as developer, tester, etc. Note that
+there should be spaces around " - " when using that operation. This is needed so as to prevent the terms 
+such as "Front-end" from getting interpreted as "<em>Front</em> but not <em>end</em>". Again, the parser may work in
+some cases, but it is safest to explicitly specify such (e.g. tester:kurtg+seanc) when such constraints
+are needed.
+</p>
+"""
+    print "<table class='query_examples'>"
+    print "  <tr>"
+    query = "Front-end p1 open bugs tester:kurtg,seanc"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>repors whose tester is either kurtg or seanc are selected</td>"
+    print "  </tr><tr>"
+    query = "Front-end p1,2 open bugs tester:kurtg+seanc"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>repors that have both kurtg and seanc as testers are selected</td>"
+    print "  </tr><tr>"
+    query = "Front-end p1 open bugs tester kurtg but not seanc"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a> <em class='help'>&ndash; works, but such is fragile</em></td>"
+    print "    <td rowspan='2'>repors that have kurtg as the tester but not seanc are selected (needs spaces around ' - ')</td>"
+    print "  </tr><tr>"
+    query = "Front-end p1 open bugs tester:kurtg - seanc"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a> <em class='help'>&ndash; safer</em></td>"
+    print "  </tr>"
+    print "</table>"
+
+    print "</div>"
+
+    print """
+<h3 id='related'>Finding related bugs</h3>
+<p>
+When two bugs are related, one normally has the other as a SeeAlso tag in the form <em>bug(n)</em>. When a bug is related
+a CRM ticket, it normally has the reference in the SeeAlso field as <em>crm(n)</em>. If the relationship has been marked this 
+way in the database, one can look for the related bugs as follows.
+</p>
+"""
+
+    print "<table class='query_examples'>"
+    print "  <tr>"
+    query = "reports related to bug 127142"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'SeeAlso': 'bug(127142)'} <em class='help'>&ndash; &quot;reports related...&quot; has to be used to fetch suggestions; otherwise, only bugs.</em></td>"
+    print "  </tr><tr>"
+    query = "bugs related to crm 1128937"
+    print "    <td><a href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ReportType': 'bug', 'SeeAlso': 'crm(1128937)'}</td>"
+    print "  </tr>"
+    print "</table>"
+
+    print """
+<h3 id='aliases'>Aliases</h3>
+<p>
+Following aliases exist to save a few keystrokes. We can add more aliases as needed for often typed and/or long words.
+</p>
+
+<ul>
+  <li><strong>ReportedBy:</strong> reporter</li>
+  <li><strong>PrimaryDeveloper:</strong> developer, devel</li>
+  <li><strong>ProjecrManager:</strong> manager</li>
+  <li><strong>QAContact:</strong> tester</li>
+  <li><strong>FunctionalCategory:</strong> fcat</li>
+  <li><strong>FunctionalArea:</strong> farea</li>
+  <li><strong>version x.x.x:</strong> Vx.x.x <em class='help'>e.g. V10 &rarr; version 10</em></li>
+  <li><strong>Mathematica version x.x.x:</strong> Mx.x.x <em class='help'>e.g. M10 &rarr; Mathematica version 10</em></li>
+  <li><strong>WolframAlpha:</strong> alpha</li>
+  <li><strong>ProbabilityAndStatistics:</strong> statistics</li>
+</ul>
+"""
+
+    print """
+<h3 id='future'>Future plans</h3>
+<ol>
+  <li><strong>Missing attributes:</strong> At the moment, not every attribute is stored in MySQL; e.g. information about the external reporters. 
+      Incomplete update information is another one. The date a report last updated is stored as an attribute and bugs
+      can be searched by that value, but who updated when is not stored in an easily searchable form. And some other attributes are not the ones people 
+      often search by; e.g. <em>UserImpact</em>.  We will add such as the need arises.</li>
+  <li><strong>String matching:</strong> Currently, searching is done only by equivalence except for summary and problem description.
+      Search by matching string (not quite regexp pattern) would be useful for attributes such as <em>SeeAlso</em> and <em>FunctionalArea</em>.</li>
+  <li><strong>Extension of query by Area and Contact:</strong> Some have asked to be able to extend the loaded query constraint by the Area(s) 
+      and Contact(s) of the bugs by means of URLs linked to them.</li>
+  <li><strong>Ordering by Area:</strong> People have been asking for this. The problem right now is, we do not have that info by the time the
+      page is loaded; they are fetched afterwards. Previous iteration of this tool have shown fetching all info at once -- given the number of
+      table joins -- slows down the search quite a bit. We will try again; most probably with separate functions so we will see the slowness
+      only when ordering by area is set.</li>
+</ol>
+"""
+
+    sign_off()
+    end_page()
+
+
+def print_query_help_popup( ):
+    """
+    print the query help pop up Window linked to the '?' besides the query text field
+    """
+    print "<div id='help'>"
+    print "<span id='close'>&times;</span>"
+    print "<p>"
+    print "The table shows a few examples of the kind of bugs search queries one can submit to the server and how they are interpreted."
+    print "Please see the <a target='_blank' class='more' href='"+SCRIPT_NAME+"?mode=help'>help page</a> for more examples."
+    print "</p>"
+
+    print "<table class='query_examples'>"
+    print "  <tr><th>query</th><th>interpretation</th></tr>"
+    print "  <tr>"
+    query = "Mathematica bugs filed today"
+    print "    <td><a target='_blank' href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'Mathematica', 'ReportType':'Bug', 'DateReported':'today'}</td>"
+    print "  </tr><tr>"
+    query = "DatabaseLink p1 and p2 bugs"
+    print "    <td><a target='_blank' href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'FunctionalCategory':'DatabaseLink', 'Priority':'1,2', 'ReportType':'Bug'}</td>"
+    print "  </tr><tr>"
+    query = "bugs I filed last 2 weeks"
+    print "    <td><a target='_blank' href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'ReportType':'Bug', 'ReportedBy':'"+REMOTE_USER+"', 'DateReported':'last2weeks'}</td>"
+    print "  </tr><tr>"
+    query = "my open p1 bugs"
+    print "    <td><a target='_blank' href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'&lt;relevant_role&gt;':'"+REMOTE_USER+"', 'Status':'Open', 'Priority':'1', 'ReportType':'Bug'}</td>"
+    print "  </tr><tr>"
+    query = "Mathematica bugs resolved from Feb 1 to Feb 15 2013"
+    print "    <td><a target='_blank' href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program':'Mathematica', 'ReportType':'Bug', 'DateResolved':'from20130201to20130215'}</td>"
+    print "  </tr><tr>"
+    query = "Mathematica bugs whose version > 10.0.1"
+    print "    <td><a target='_blank' href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+General.escape_xml(query)+"</a></td>"
+    print "    <td>{'Program':'Mathematica', 'ReportType':'Bug', 'VersionReported':'&gt;10.0.1'}</td>"
+    print "  </tr><tr>"
+    query = "summary:+Hurricane +Location -- WolframAlpha"
+    print "    <td><a target='_blank' href='"+SCRIPT_NAME+"?query="+urllib.quote_plus(query)+"'>"+query+"</a></td>"
+    print "    <td>{'Program': 'WolframAlpha', 'summary': '+Hurricane +Location'} <em class='help'>&ndash; keyword search in summary</em></td>"
+    print "  </tr>"
+    print "</table>"
+
+    print "<span id='more'><a target='_blank' class='more' href='"+SCRIPT_NAME+"?mode=help'>more...</a></span>"
+    print "</div>"
+
+
+def print_query_form( head=False ):
+    """
+    print free text query text field and pop up help
+    """
+    if GLOB['keyword']: 
+        query_str = GLOB['body']
+        keyword_checked_str = "checked='checked'"
+    elif GLOB['autokeyword']: 
+        query_str = GLOB['body']
+        keyword_checked_str = ""
+    else:
+        query_str = GLOB['query']
+        keyword_checked_str = ""
+
+    print "<div id='formcont'>"
+    print "<div id='formdiv'>"
+    if head:
+        print "<div id='main_page_head'>Find <img id='head' src='../images/bug.jpg' alt='Bug'/>s</div>"
+    print "<form style='margin:0; padding:0'  method='get' action='"+SCRIPT_NAME+"'>"
+    print "<p>"
+    print "<span id='helplink'><img src='../images/question_mark.jpg' alt='?'/></span>"
+    print "Search: <input type='text' name='query' size='80' value='"+General.escape_xml(query_str)+"'></input>"
+    print "<input type='submit' value='find'></input>"
+    print "<input type='checkbox' "+keyword_checked_str+" name='keyword'></input>keyword search"
+    print "</p>"
+    print "</form>"
+    print "</div>"
+    print "</div>"
+
+    print_query_help_popup( )
+
+
+def print_head():
+    """
+    prints the "Find Bugs" head at the top left
+    """
+    print "<div id='head_top_left'>"
+    print "Find <img id='head' src='../images/bug.jpg' width='25' height='25' alt='Bug'/>s"
+    print "</div>"
+
+
+def get_by_status_links_str( constr_dic ):
+    """
+    makes the "by status" links put on top of the table. By this statge
+    the case of the 'status' key in constr_dic must have been fixed to 
+    be constr_dic['Status']
+    """
+    url_elems = list( urlparse.urlsplit(REQUEST_URI) )
+#   url_elems[3] = re.sub( r'(?i)&?autostatus=[^&]*', '', url_elems[3] ).strip('&')
+    url_elems[3] = re.sub( r'(?i)&?(auto|)status=[^&]*', '', url_elems[3] ).strip('&')
+    url_sans_autostatus = urlparse.urlunsplit( url_elems )
+
+    def make_link( status ):
+        return "<a href='"+url_sans_autostatus+"&amp;autostatus="+status+"'>"+status+"</a>"
+
+    # -- resolve negation in Status value (e.g. !Closed,Resolved => 'Open')
+    try:
+        status_vals_str = constr_dic['Status'].lower()
+    except  ( TypeError, KeyError ): 
+        status_vals_str = 'all'
+
+    if 'all' in status_vals_str:
+        status_vals = ('all',)
+    else:
+        negateQ = '!' in status_vals_str
+        status_vals = status_vals_str.strip('!').replace(' ','').split(',')
+        if negateQ: status_vals = list(set(['open','resolved','closed']) - set(status_vals))
+
+    status_vals_str = ','.join( status_vals ) # -- put back resolved value(s) together
+
+    links_by_stats_str = "<span id='by_status_links'>"
+    for status in ( 'open', 'resolved', 'all' ):
+        if status == status_vals_str:
+            links_by_stats_str += status.capitalize()
+        else:
+            links_by_stats_str += make_link( status.capitalize() )
+        if status != 'all': links_by_stats_str += "&nbsp;&nbsp;"
+    links_by_stats_str += "</span>"
+
+    return links_by_stats_str
+
+
+def print_bugs_html( dbc, bugs, query, query_norm, constr_dic, params ):
+    """
+    print the regular HTML page
+    """
+    print "Content-type: text/html\n"
+
+    start_html()
+    start_page( "Bugs Search")
+    print_head()
+    print_top_menu( dbc )
+    print_query_form()
+
+    print "<div id='display'></div>"
+
+    links_by_stats_str = get_by_status_links_str( constr_dic )
+
+    total_str = "total: " + str( len(bugs) )
+    if len(bugs) == params['count']: total_str = total_str + ' (limited)'
+
+    constr_dic_str = General.escape_xml( str(constr_dic) )
+
+    if query_norm: 
+        query_norm_html = query_norm.replace('&','&amp;')
+        query_link_text = "<a href='"+SCRIPT_NAME+"?"+query_norm_html+"'>query</a>"
+    else: 
+        query_link_text = "query"
+
+    print "<p>"
+    if constr_dic: # -- no query: bug numbers are given directly only to display
+        print "<span id='query' query_dict='" + constr_dic_str + "'>"+query_link_text+"</span>"
+        print links_by_stats_str, 
+    print total_str
+
+    if params['autokeyword']: 
+        print "<span id='keyword'>auto keyword search</span>";
+    print "<span id='status'>Loading...</span>"
+    print "</p>"
+
+    try:
+        if   constr_dic.has_key('description') and not re.match(r'!?~',constr_dic['description']):
+            orderby = 'description_score'
+        elif constr_dic.has_key('problem')     and not re.match(r'!?~',constr_dic['problem']):
+            orderby = 'description_score'
+        elif constr_dic.has_key('summary')     and not re.search(r'!?~',constr_dic['summary']): 
+            orderby = 'summary_score'
+        else:
+            orderby = 'normal'
+    except:
+        orderby = 'normal'
+
+    print_bugs_table( dbc, bugs, constr_dic, orderby )
+
+    sign_off()
+    end_page()
+
+
+def print_bugs_data( dbc, bugs, attributes='' ):
+    """
+    prints specified attributes of the bugs found by the search query. 
+    e.g. format=data&attributes=FunctionalArea,FunctionalCategory,Component
+
+    Python 2.4 does not support json module. So, for now this just prints out python dict.
+    Change it to json when we have 2.6+
+    """
+    print "Content-type: text/plain\n"
+
+    key_eq = { 'product':'program' }
+
+    attr_key_to_query = {}
+    for attr_query in re.split( r'\s*,\s*', attributes.strip() ): # -- construct { 'normalized_attr':'specified_attr' }
+        key = attr_query.replace('_','').replace(' ','').lower()
+        attr_key_to_query[key] = attr_query
+
+    data = Bugs.GetInfo( bugs, attributes, dbc )
+
+    attr_db_to_key, data_rearranged = {}, {}
+    for bugn, data_bug in data.items():
+        data_rearranged[bugn] = {}
+        for attr_db, val in data_bug.items():
+            try: 
+                key = attr_db_to_key[ attr_db ]
+            except KeyError:
+                key = attr_db.replace('_','').replace(' ','').lower()
+                attr_db_to_key[ attr_db ] = key
+
+            try:
+                data_rearranged[bugn][attr_key_to_query[key]] = val
+            except KeyError:
+                try:
+                    data_rearranged[bugn][attr_key_to_query[key_eq[key]]] = val
+                except KeyError:
+                    data_rearranged[bugn][key] = val
+  
+    print data_rearranged
+
+
+def show_bugs( dbc, form, bugs, query, query_norm, constr_dic, params ):
+    """
+    Initiate displaying bugs found
+    """
+    format = get_param(form, 'format')
+    if not format: format = ''
+
+    if format in ('list','text'):
+        print_bugs_text( bugs )
+    elif format == 'data':
+        attributes = get_param(form, 'attributes')
+        if not attributes: 
+            attributes = get_param(form, 'params')
+        print_bugs_data( dbc, bugs, attributes )
+    else:
+        print_bugs_html( dbc, bugs, query, query_norm, constr_dic, params )
+
+
+def find_main( dbc, form ):
+    """
+    Main function that finds bugs
+    """
+    query = GLOB['query'].strip()
+    if query: 
+        if not query.isdigit() and re.match( r'^(?i)\s*(bugs?:?|)\s*[\d,\s]+$', query ): # -- a list of bugs numbers directly given for display
+            bugs_str = re.sub( r'^\s*(bugs?:?|)\s*', '', query.strip() )
+            bugs = re.split( r'[\s,]+', bugs_str )
+            general_params = get_general_params( form )
+            show_bugs( dbc, form, bugs, query, None, None, general_params )
+            return 1 
+        else:
+            constr_dic, params = parse_query( dbc, form, query )
+
+            query_elems = []
+            for attr, val in constr_dic.items():
+                query_elems.append( attr + '=' + str(val) )
+                query_norm = '&'.join( query_elems ) # -- normalized query after parsing less structured query
+    else:
+        constr_dic, params = get_constraint( form )
+        query_norm = None
+
+    normalize_key_case( constr_dic ) # -- normalize case of some keys (e.g. 'status'=>'Status') we need to access (e.g. auto set)
+    make_auto_settings( constr_dic ) # -- auto set status,  (to 'Open' under certain cercumstances), resolution, etc.?
+
+#   if 'autokeyword' in constr_dic: # -- project 'autokeyword' to 'keyword' before feeding into Bugs.Find()
+#       constr_dic['keyword'] = constr_dic['autokeyword']
+#       del constr_dic['autokeyword'] 
+
+    try:
+        bugs  = Bugs.Find( constr_dic, dbc, count=params['count'], skip=params['skip'], lower=params['lower'], upper=params['upper'] )
+    except SyntaxError, ex:
+        extra = "SyntaxError: Make sure URL is properly encoded"
+        die( extra + "<br/><br/>\n\n" + ex, 'html' )
+    except "InvalidBugAttributeError", ex:
+        die( ex, 'html' )
+    except Exception, ex:
+        log_stamp = time.strftime( "[%Y-%m-%d %H:%M:%S]", time.localtime() ) + " " + REMOTE_USER
+        query_log_fh, failure_log_fh = open_log_files()
+
+        ex_msg = "\n\n" + log_stamp + " -\t" + str(constr_dic) + "\t***** EXCEPTION CAUGHT from Bugs.Find() *****\t" + str(ex)
+        if query: ex_msg += " - \tquery: " + query
+
+        query_log_fh.write( ex_msg )
+        failure_log_fh.write( ex_msg )
+
+        query_log_fh.close()
+        failure_log_fh.close()
+
+        print_error_html( "Unexpected exception caught from Bugs.Find(). Please contact <a href='mailto:d-qa@wolfram.com'>d-qa</a>." )
+
+
+    show_bugs( dbc, form, bugs, query, query_norm, constr_dic, params )
+
+
+def show_info( bugnum, format ):
+    """
+    brings bug info from MySQL database in text/plain
+    """
+    oBug = Bug( bugnum )
+    oBug.fetch_data()
+    data = oBug.get('data')
+
+    if format and format == 'json':
+        # -- might need camel=true as well to convert e.g. primary_developer to PrimaryDeveloper
+        print "cannot import json in 2.4. Implement this when we run on python 2.6"
+    else:
+        for key, value in data.iteritems():
+            if isinstance( value, (list, tuple) ): 
+                value_pr = ', '.join( map(str,value) )
+            else:
+                value_pr = str( value )
+    
+            print key + ':' + value_pr
+
+ 
+def show_problem( bugnum ):
+    """
+    fetch and display problem from the bugstats.current_status table
+    """
+    dbc, newQ = Databases.GetDBC('bugstats')
+    cur = dbc.cursor()
+
+    cur.execute("select problem from current_status where bug_id=" + str(bugnum))
+    row = cur.fetchone()
+
+    cur.close()
+    dbc.close()
+
+    print row['problem']
+
+
+def show_area( bugs ):
+    """
+    fetch and display the first of func are, func cat, comp, or product to be found of bugs (csv) in the form
+    bugnumber:area_name:area_value
+    """
+    bugnums = bugs.replace(' ','').split(',')
+    bugnums = map( int, filter(str.isdigit, map(str,bugnums)) )
+    if not bugnums: return
+
+    for area in ['functional_area','functional_category','component','product']:
+        buginfo = Bugs.GetInfo( bugnums, area )
+        rest = []
+        for bugn in bugnums:
+            try: 
+                value = ', '.join(buginfo[bugn][area]).strip()
+                if value: print str(bugn) + ':' + area + ':' + value
+                else:     rest.append( bugn )
+            except KeyError: 
+                rest.append( bugn )
+
+        if rest: bugnums = rest
+        else   : break
+
+
+def show_contact( bugs, contact_param ):
+    """
+    fetch and display qa_contact (tester) of bugs (csv) in the form
+    bugnumber:qac1,qac2,...
+    """
+    buginfo = Bugs.GetInfo( bugs.split(','), contact_param )
+
+    for bugn, info in buginfo.iteritems():
+        print str(bugn)+':'+contact_param+':'+','.join( info[contact_param] )
+
+
+def sign_off():
+    print """
+<hr/>   
+<p>         
+<a style='margin:0px' href="https://internal.wolfram.com/qa">Quality Assurance</a><br/>
+<a style='margin:0px' href="mailto:d-qa@wolfram.com">Comments and Suggestions</a>
+<br/><br/><br/><br/>
+</p>        
+"""
+
+
+def get_param( form, param, default='' ):
+    """
+    get cgi parameter value from from
+    """
+    try:
+        val = form[param].value
+    except KeyError: 
+        val = default
+
+    return val
+
+
+def normalize_cgi_params( form ):
+    """
+    Normalize the cgi params that need to be and set it in the GLOB dict.
+    Only those needed such normalization and those needed at many places
+    (globally) are set here. The rest is accessed through the 'form'.
+    """
+    query = get_param(form, 'query')
+    if not query: # -- bugs home uses the term 'search'
+        query = get_param(form, 'search')
+    GLOB['query'] = query.strip()
+
+    body = get_param(form, 'body') # -- in keyword only search, 'query' is set to 'body'
+    GLOB['body'] = body.strip()
+
+    auto_status = get_param( form, 'autostatus' )
+    if auto_status: GLOB['autostatus'] = auto_status
+    else          : GLOB['autostatus'] = None
+
+    onQ = re.compile( r'(?i)^(1|on|true|yes)$' )
+    for param in ('keyword','autokeyword'): # -- Boolean params
+        param_setQ = get_param( form, param )
+        if onQ.match( param_setQ ): GLOB[ param ] = 1
+        else                      : GLOB[ param ] = 0
+
+
+def main():
+    """
+    Main function
+    """
+    global REMOTE_USER, GLOB # -- this might be changed here
+
+    dbc, newQ = Databases.GetDBC( 'bugstats' )
+
+    GLOB['user_role'] = Bugs.GetRole( REMOTE_USER, dbc )
+    if not GLOB['user_role']: GLOB['user_role'] = ''
+
+    form = cgi.FieldStorage()
+    normalize_cgi_params( form )
+
+    keys = form.keys()
+    keys_rest = list( set(keys) - set(['keyword','autokeyword','autostatus']) ) # -- these keys by themselves do not mean a search
+
+    if form and keys_rest:
+        view_as = get_param(form, 'view_as' )
+        if view_as: REMOTE_USER = view_as
+
+        mode = get_param(form, 'mode') # -- mode = '' => search
+
+        if mode == 'fetch':
+            entity = get_param(form, 'entity')
+            print "Content-type: text/plain\n"
+
+            format = get_param(form, 'format')
+
+            if entity in ['attributes','problem']:
+                bugnum = int( get_param(form,'bugnumber',0).strip() )
+                if bugnum == 0:
+                    print "bugnumber not specified."
+                    sys.exit(0)
+
+            if entity in ['area','developer','tester']:
+                bugs = get_param(form, 'bugs')
+                if bugs == '':
+                    print "ERROR: bugs not specified."
+                    sys.exit(0)
+
+            if entity == 'attributes':
+                show_info( bugnum, format )
+            elif entity == 'problem':
+                show_problem( bugnum )
+            elif entity == 'area':
+                show_area( bugs )
+            elif entity == 'tester':
+                show_contact( bugs, 'qa_contact' )
+            elif entity == 'developer':
+                show_contact( bugs, 'primary_developer' )
+        elif mode == 'help':
+            print_query_help_page( dbc ) 
+        else:
+            find_main( dbc, form )
+    else:
+        print_query_main_page( dbc )
+
+    dbc.close()
+
+main()
+

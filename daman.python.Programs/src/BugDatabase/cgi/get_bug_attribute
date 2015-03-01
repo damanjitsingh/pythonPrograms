@@ -1,0 +1,29 @@
+#!/usr/bin/perl
+
+use strict;
+use CGI;
+
+use WRI::QA::Bugs::Bug;
+
+my $QUERY = new CGI;
+
+&main( $QUERY );
+
+sub main {
+    my( $query ) = @_;
+
+    my $bugnumber = $query->param('number')    || do{ print "Bug number not defined.\n";      exit };
+    my $attribute = $query->param('attribute') || do{ print "Bug attribute not specified.\n"; exit };
+
+    do{ print "Invalid bug number '$bugnumber'.\n"; exit } unless $bugnumber =~ /^\d+$/;
+
+    my $oBug = new Bug( $bugnumber );
+    $oBug->fetch_data();
+    
+    my $attribute_value = $oBug->get($attribute); 
+
+    $attribute_value = '' unless defined $attribute_value;
+  
+    print "Content-type: text/plain\n\n";
+    print "$attribute_value\n";
+}
