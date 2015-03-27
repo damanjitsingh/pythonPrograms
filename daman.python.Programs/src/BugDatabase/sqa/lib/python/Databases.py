@@ -4,7 +4,6 @@ import os, sys, time, re, calendar, datetime, subprocess
 
 from datetime import date
 
-import MySQLdb
 import MySQLdb.cursors
 
 TesterDB   = { 'name':'testerdb',     'host':'testhub',      'user':'testmngr',   'password':'password'   }

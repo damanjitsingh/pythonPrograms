@@ -24,15 +24,15 @@ def main():
     Find(r'iiig', 'called piiig')
     #\w matched word character, any char, digit, underscore
     Find(r':\w\w\w', 'blah :c1t blah blah ')
-    #/d matches any digit
+    #\d matches any digit
     Find(r'\d\d\d', 'blah :123 blah blah ')
-    #/s matches single space
+    #\s matches single space
     Find(r'\d\s\d\s\d','blah :1 2 3 blah')
     # + means one or more spaces in the below example, * means zero or more
     Find(r'\d\s+\d\s+\d','blah :1      2      3 blah')
     #space is not a word character
     Find(r':\w+','blah :kitten some number of word characters')
-    #/S matches all non white space characters
+    #\S matches all non white space characters
     Find(r':\S+', 'blah :kitten123123@&yatta blah blah')
     #extracting email from the text below
     Find(r'\S+@\S+', 'blah d.singh@gmail.com yatta #@ blah blah')
