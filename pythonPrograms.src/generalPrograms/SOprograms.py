@@ -36,8 +36,26 @@ def my_crappy_range(N):
         i += 1
     return   
 ##########################################################################################
-        
+def taxicab():
+    t = 10000
+    cubes, crev = [x**3 for x in range(1,1000)], {}
+    # for cube root lookup
+    for x,x3 in enumerate(cubes): crev[x3] = x + 1
+    
+    sums = sorted(x + y for x in cubes for y in cubes if y < x)
+    
+    idx = 0
+    n = 0
+    for i in range(1, len(sums)-1):
+        if sums[i-1] != sums[i] and sums[i] == sums[i+1]:
+            n = sums[i]
+            if n<t:
+                idx += 1
+                print(n)
+            else:
+                break
 
 if __name__ == '__main__':
-    my_crappy_range(100)
+    #my_crappy_range(100)
+    taxicab()
     
